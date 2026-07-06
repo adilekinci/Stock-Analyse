@@ -1,0 +1,324 @@
+//@version=6
+// ============================================================================
+//  GİRİŞ ZAMANI DEĞERLENDİRMESİ — Adil  (v6: ATR Chandelier stop)
+//  Uzun vadeli. Tek soru: "Trend hissesine ŞU AN girmeli miyim?"
+//
+//  v5 DÜZELTMELERİ (guru eleştirisi):
+//   1) RSI/Bollinger artık GÜCÜ alır, zayıflığı değil (mean-reversion kaldırıldı).
+//   2) Trend göstergeleri (Momentum + MACD) ağırlığı düşürüldü (çorba/collinearity ↓).
+//      Yön kümesi: Momentum ±1 + MACD ±1 + MA ±2  (eski 6 yerine 4).
+//   3) VWAP -> YTD Anchored VWAP (günlük grafikte anlamlı).
+//   4) POC artık "pahalı/ucuz" değil: "POC üstü = boğa zemini / POC altı = ayı duvarı".
+//
+//  v6: Dinamik stop EMA -> ATR Chandelier Exit (son tepeden 3xATR, trailing).
+//  Hacim seviyeleri & AVWAP & POC oya KARIŞMAZ (bağlam). Stop = bağlam/çıkış.
+// ============================================================================
+
+indicator("Giriş Zamanı Değerlendirmesi — Adil v6", overlay = true, max_lines_count = 50)
+
+// ---------------------------------------------------------------------------
+//  AYARLAR
+// ---------------------------------------------------------------------------
+grpHTF = "Üst Trend (Yön)"
+htfTf  = input.timeframe("W", "Üst trend zaman dilimi", group = grpHTF, tooltip = "Günlük grafikte 'W' bırak.")
+
+grpM   = "Momentum (8/21 EMA)"
+emaF   = input.int(8,  "Hızlı EMA",  group = grpM, minval = 2)
+emaS   = input.int(21, "Yavaş EMA",  group = grpM, minval = 3)
+
+grpL   = "Uzunluklar"
+rsiLen = input.int(14, "RSI",            group = grpL, minval = 2)
+maFast = input.int(50, "Hızlı MA (50)",  group = grpL, minval = 2)
+maSlow = input.int(200,"Yavaş MA (200)", group = grpL, minval = 5)
+volLen = input.int(20, "Hacim ortalaması",group = grpL, minval = 2)
+cmfLen = input.int(20, "CMF",            group = grpL, minval = 2)
+obvLen = input.int(20, "OBV EMA",        group = grpL, minval = 2)
+bbLen  = input.int(20, "Bollinger",      group = grpL, minval = 2)
+bbMult = input.float(2.0,"Bollinger çarpan", group = grpL, step = 0.1)
+volMult= input.float(1.2,"Yüksek hacim eşiği (x ort)", group = grpL, step = 0.1)
+
+grpVW  = "AVWAP (çapalı)"
+avwapMode  = input.string("YTD", "Çapa", options = ["YTD","Manuel tarih"], group = grpVW, tooltip = "YTD = yılbaşından beri. Manuel = aşağıdaki tarihten beri (örn. son bilanço günü).")
+anchorDate = input.time(timestamp("01 Jan 2026"), "Manuel çapa tarihi", group = grpVW)
+
+grpVP  = "Hacim Profili (Destek/Direnç)"
+vpLook = input.int(250, "Geçmiş (bar) — ~1 yıl", group = grpVP, minval = 30)
+vpBins = input.int(24,  "Fiyat dilimi sayısı",   group = grpVP, minval = 8, maxval = 50)
+
+grpStop = "Dinamik Stop (Chandelier ATR)"
+atrLen  = input.int(22,  "ATR / tepe periyodu", group = grpStop, minval = 2, tooltip = "Standart Chandelier = 22. ATR hem volatilite hem tepe penceresi.")
+atrMult = input.float(3.0,"ATR çarpanı",        group = grpStop, step = 0.1, tooltip = "Uzan vade için 3x dengeli. Büyütürsen stop genişler (geç çıkış).")
+
+grpT   = "Göstergeyi Skora Kat (aç/kapa)"
+momoOn = input.bool(true,  "Momentum (8/21) ±1", group = grpT)
+rsiOn  = input.bool(true,  "RSI ±2",        group = grpT)
+macdOn = input.bool(true,  "MACD ±1",       group = grpT)
+maOn   = input.bool(true,  "MA dizilim ±2", group = grpT)
+volOn  = input.bool(true,  "Hacim ±1",      group = grpT)
+cmfOn  = input.bool(true,  "CMF ±2",        group = grpT)
+obvOn  = input.bool(true,  "OBV ±1",        group = grpT)
+vwapOn = input.bool(true,  "AVWAP ±1",      group = grpT)
+bbOn   = input.bool(true,  "Bollinger ±2",  group = grpT)
+
+grpV   = "Görünüm"
+tblPos = input.string("top_right", "Tablo konumu", options = ["top_right","top_left","bottom_right","bottom_left","middle_right"], group = grpV)
+bgTint = input.bool(true, "Karara göre arka plan tonu", group = grpV)
+showLines = input.bool(true, "Hacim seviyesi çizgileri", group = grpV)
+showEma   = input.bool(true, "8/21 EMA çiz", group = grpV)
+
+// ---------------------------------------------------------------------------
+//  RENKLER
+// ---------------------------------------------------------------------------
+cellBg   = color.new(#eef1f6, 0)
+darkBg   = color.new(#2a2e39, 0)
+txtDark  = color.black
+txtLight = color.white
+
+// ---------------------------------------------------------------------------
+//  1) ÜST TREND (SMA 50/200, haftalık)
+// ---------------------------------------------------------------------------
+f_htf() =>
+    [close, ta.sma(close, maFast), ta.sma(close, maSlow)]
+[htfClose, htfMa50, htfMa200] = request.security(syminfo.tickerid, htfTf, f_htf(), lookahead = barmerge.lookahead_off)
+htfScore = na(htfMa50) ? na : na(htfMa200) ? (htfClose > htfMa50 ? 1 : -1) : (htfClose > htfMa50 and htfMa50 > htfMa200) ? 1 : (htfClose < htfMa200 and htfMa50 < htfMa200) ? -1 : 0
+htfTxt = na(htfScore) ? "—" : htfScore == 1 ? "🟢 Yukarı" : htfScore == -1 ? "🔴 Aşağı" : "🟡 Karışık"
+htfCol = na(htfScore) ? color.new(#787b86, 20) : htfScore == 1 ? color.new(#0b8043, 0) : htfScore == -1 ? color.new(#c0362c, 0) : color.new(#9e8b00, 0)
+
+// ---------------------------------------------------------------------------
+//  2) MOMENTUM (8/21) — yön kümesi, ağırlık ±1
+// ---------------------------------------------------------------------------
+ema8  = ta.ema(close, emaF)
+ema21 = ta.ema(close, emaS)
+momoScore = ema8 > ema21 ? 1 : -1
+momoTxt   = ema8 > ema21 ? (close > ema8 ? "Güçlü ↑" : "Pozitif ↗") : (close < ema8 ? "Zayıf ↓" : "Zayıflıyor ↘")
+
+// ---------------------------------------------------------------------------
+//  3) GÖSTERGELER
+// ---------------------------------------------------------------------------
+rsi  = ta.rsi(close, rsiLen)
+[macdLine, signalLine, histLine] = ta.macd(close, 12, 26, 9)
+ma50 = ta.sma(close, maFast)
+ma200= ta.sma(close, maSlow)
+volAvg = ta.sma(volume, volLen)
+
+mfMult = (high == low) ? 0.0 : ((close - low) - (high - close)) / (high - low)
+mfVol  = mfMult * volume
+cmf    = math.sum(volume, cmfLen) != 0 ? math.sum(mfVol, cmfLen) / math.sum(volume, cmfLen) : 0.0
+
+obvVal = ta.obv
+obvEma = ta.ema(obvVal, obvLen)
+
+// --- YTD / Manuel ANCHORED VWAP (oturum-vwap yerine) ---
+bool startAnchor = avwapMode == "YTD" ? (year != year[1]) : (time >= anchorDate and time[1] < anchorDate)
+var float sumPV = 0.0
+var float sumV  = 0.0
+if startAnchor
+    sumPV := 0.0
+    sumV  := 0.0
+sumPV := sumPV + hlc3 * volume
+sumV  := sumV + volume
+avwap = sumV != 0 ? sumPV / sumV : na
+
+[bbBasis, bbUpper, bbLower] = ta.bb(close, bbLen, bbMult)
+bbWidth    = bbBasis != 0 ? (bbUpper - bbLower) / bbBasis : 0.0
+bbWidthAvg = ta.sma(bbWidth, 50)
+squeeze    = bbWidth < bbWidthAvg
+
+priceUp = close > close[1]
+volHigh = volume > volAvg * volMult
+
+// === TREND-ONAYLAYAN SKORLAR (v5: gücü al, zayıflığı değil) ===
+// RSI: 50-65 sağlam trend (+2), >65 aşırı alım ama pozitif (+1), 40-50 nötr, <40 zayıf, <30 çöp.
+rsiScore  = rsi > 65 ? 1 : rsi > 50 ? 2 : rsi > 40 ? 0 : rsi > 30 ? -1 : -2
+// MACD: ±1 (collinearity ↓)
+macdScore = macdLine > signalLine ? 1 : -1
+// MA dizilim: ±2 (yapısal çapa)
+maScore   = (close > ma50 and ma50 > ma200) ? 2 : (close > ma50) ? 1 : (close < ma200 and ma50 < ma200) ? -2 : -1
+volScore  = volHigh ? (priceUp ? 1 : -1) : 0
+cmfScore  = cmf > 0.25 ? 2 : cmf > 0.05 ? 1 : cmf < -0.25 ? -2 : cmf < -0.05 ? -1 : 0
+obvScore  = obvVal > obvEma ? 1 : -1
+vwapScore = na(avwap) ? 0 : (close > avwap ? 1 : -1)
+// Bollinger: üst bant = güç (+2), orta-üst tutunma (+1), orta-alt (-1), alt bant = zayıf (-2)
+bbScore   = close >= bbUpper ? 2 : (close > bbBasis and close < bbUpper) ? 1 : close <= bbLower ? -2 : -1
+
+momoS = momoOn ? momoScore : 0
+rsiS  = rsiOn  ? rsiScore  : 0
+macdS = macdOn ? macdScore : 0
+maS   = maOn   ? maScore   : 0
+volS  = volOn  ? volScore  : 0
+cmfS  = cmfOn  ? cmfScore  : 0
+obvS  = obvOn  ? obvScore  : 0
+vwapS = vwapOn ? vwapScore : 0
+bbS   = bbOn   ? bbScore   : 0
+total = momoS + rsiS + macdS + maS + volS + cmfS + obvS + vwapS + bbS
+
+maxPossible = (momoOn?1:0)+(rsiOn?2:0)+(macdOn?1:0)+(maOn?2:0)+(volOn?1:0)+(cmfOn?2:0)+(obvOn?1:0)+(vwapOn?1:0)+(bbOn?2:0)
+strongBuyTh = maxPossible * 0.55
+buyTh       = maxPossible * 0.25
+waitTh      = -maxPossible * 0.15
+avoidTh     = -maxPossible * 0.45
+
+verdict = total >= strongBuyTh ? "🟢 GÜÇLÜ AL" : total >= buyTh ? "🟢 KADEMELİ AL" : total >= waitTh ? "🟡 BEKLE" : total >= avoidTh ? "🟠 İZLE / BEKLE" : "🔴 ÇIK / KAÇIN"
+verdictCol = total >= strongBuyTh ? color.new(#0b8043, 0) : total >= buyTh ? color.new(#26a69a, 0) : total >= waitTh ? color.new(#9e8b00, 0) : total >= avoidTh ? color.new(#e8830c, 0) : color.new(#c0362c, 0)
+
+// ---------------------------------------------------------------------------
+//  4) HACİM PROFİLİ — POC + en yoğun hacim bölgeleri
+// ---------------------------------------------------------------------------
+// Chandelier Exit (long): son tepeden atrMult*ATR aşağı, sadece YÜKSELİR (trailing).
+atrVal  = ta.atr(atrLen)
+chBasis = ta.highest(high, atrLen) - atrVal * atrMult
+var float chandStop = na
+chandStop := na(chandStop[1]) ? chBasis : (close[1] > chandStop[1] ? math.max(chBasis, chandStop[1]) : chBasis)
+stopDistPct = close != 0 ? (close - chandStop) / close * 100 : na
+
+float pocLevel = na
+float resVol   = na
+float supVol   = na
+
+if barstate.islast
+    int lb = math.min(vpLook, bar_index)
+    float hh = ta.highest(high, lb)
+    float ll = ta.lowest(low, lb)
+    float rng = hh - ll
+    if rng > 0 and lb > 1
+        binV = array.new_float(vpBins, 0.0)
+        for i = 0 to lb - 1
+            float tp = (high[i] + low[i] + close[i]) / 3
+            int bi = int(math.floor((tp - ll) / rng * (vpBins - 1)))
+            bi := math.max(0, math.min(vpBins - 1, bi))
+            array.set(binV, bi, array.get(binV, bi) + nz(volume[i]))
+        float mx = -1.0
+        int pocB = 0
+        for b = 0 to vpBins - 1
+            float v = array.get(binV, b)
+            if v > mx
+                mx := v
+                pocB := b
+        pocLevel := ll + (pocB + 0.5) / vpBins * rng
+        float mxBelow = -1.0
+        float mxAbove = -1.0
+        int belowB = -1
+        int aboveB = -1
+        for b = 0 to vpBins - 1
+            float center = ll + (b + 0.5) / vpBins * rng
+            float v = array.get(binV, b)
+            if center < close and v > mxBelow
+                mxBelow := v
+                belowB := b
+            if center > close and v > mxAbove
+                mxAbove := v
+                aboveB := b
+        supVol := belowB >= 0 ? ll + (belowB + 0.5) / vpBins * rng : na
+        resVol := aboveB >= 0 ? ll + (aboveB + 0.5) / vpBins * rng : na
+
+// v5: POC artık "pahalı/ucuz" değil -> "boğa zemini / ayı duvarı"
+valTxt = na(pocLevel) ? "—" : close > pocLevel * 1.01 ? "POC ÜSTÜ — zemin sağlam (boğa)" : close < pocLevel * 0.99 ? "POC ALTI — satış duvarı (ayı)" : "POC üzerinde (kritik eşik)"
+valCol = na(pocLevel) ? color.new(#787b86,20) : close > pocLevel * 1.01 ? color.new(#0b8043,0) : close < pocLevel * 0.99 ? color.new(#c0362c,0) : color.new(#9e8b00,0)
+
+// ---------------------------------------------------------------------------
+//  ÇİZGİLER + ARKA PLAN
+// ---------------------------------------------------------------------------
+bgcolor(bgTint ? color.new(verdictCol, 92) : na)
+plot(maOn ? ma50  : na, "50 MA",  color = color.new(color.orange, 0), linewidth = 1)
+plot(maOn ? ma200 : na, "200 MA", color = color.new(color.blue,   0), linewidth = 2)
+plot(showEma ? ema8  : na, "8 EMA",  color = color.new(#00bcd4, 0), linewidth = 1)
+plot(showEma ? ema21 : na, "21 EMA", color = color.new(#9c27b0, 0), linewidth = 1)
+plot(vwapOn ? avwap : na, "AVWAP", color = color.new(color.fuchsia, 0), linewidth = 1)
+// Chandelier stop: sürekli merdiven çizgi (trailing stop görünür olsun)
+plot(chandStop, "Chandelier Stop (ATR)", color = color.new(#e8830c, 0), linewidth = 2, style = plot.style_stepline)
+
+var line pocLine = na
+var line resLine = na
+var line supLine = na
+if barstate.islast and showLines
+    if not na(pocLine)
+        line.delete(pocLine)
+    if not na(resLine)
+        line.delete(resLine)
+    if not na(supLine)
+        line.delete(supLine)
+    if not na(pocLevel)
+        pocLine := line.new(bar_index - 60, pocLevel, bar_index + 8, pocLevel, color = color.new(#2962ff, 0), width = 2)
+    if not na(resVol)
+        resLine := line.new(bar_index - 60, resVol, bar_index + 8, resVol, color = color.new(color.red, 0), width = 1, style = line.style_dashed)
+    if not na(supVol)
+        supLine := line.new(bar_index - 60, supVol, bar_index + 8, supVol, color = color.new(color.green, 0), width = 1, style = line.style_dashed)
+
+// ---------------------------------------------------------------------------
+//  TABLO
+// ---------------------------------------------------------------------------
+posMap = tblPos == "top_left" ? position.top_left : tblPos == "bottom_right" ? position.bottom_right : tblPos == "bottom_left" ? position.bottom_left : tblPos == "middle_right" ? position.middle_right : position.top_right
+var table t = table.new(posMap, 3, 21, border_width = 1, frame_width = 1, frame_color = color.new(color.gray, 50))
+
+f_row(_t, _r, _lbl, _val, _sc) =>
+    col = _sc > 0 ? color.new(#26a69a, 0) : _sc < 0 ? color.new(#ef5350, 0) : color.new(#787b86, 0)
+    emo = _sc >= 2 ? "✅✅" : _sc == 1 ? "✅" : _sc == 0 ? "➖" : _sc == -1 ? "⚠️" : "❌"
+    table.cell(_t, 0, _r, _lbl, text_color = txtDark, bgcolor = cellBg, text_halign = text.align_left,  text_size = size.small)
+    table.cell(_t, 1, _r, _val, text_color = txtDark, bgcolor = cellBg, text_halign = text.align_right, text_size = size.small)
+    table.cell(_t, 2, _r, emo,  text_color = txtLight, bgcolor = col, text_size = size.small)
+
+f_info(_t, _r, _lbl, _val, _bg) =>
+    table.cell(_t, 0, _r, _lbl, text_color = txtDark, bgcolor = cellBg, text_halign = text.align_left,  text_size = size.small)
+    table.cell(_t, 1, _r, _val, text_color = txtDark, bgcolor = cellBg, text_halign = text.align_right, text_size = size.small)
+    table.cell(_t, 2, _r, "",   bgcolor = _bg)
+
+if barstate.islast
+    table.cell(t, 0, 0, "⏱️ GİRİŞ DEĞERLENDİRMESİ", text_color = txtLight, bgcolor = darkBg, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, 0, syminfo.ticker, text_color = txtLight, bgcolor = darkBg, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 2, 0, str.tostring(timeframe.period), text_color = txtLight, bgcolor = darkBg, text_size = size.small)
+
+    table.cell(t, 0, 1, "Üst trend (" + htfTf + ")", text_color = txtDark, bgcolor = cellBg, text_halign = text.align_left, text_size = size.small)
+    table.cell(t, 1, 1, htfTxt, text_color = txtDark, bgcolor = cellBg, text_halign = text.align_right, text_size = size.small)
+    table.cell(t, 2, 1, na(htfScore) ? "·" : htfScore == 1 ? "✅" : htfScore == -1 ? "❌" : "➖", text_color = txtLight, bgcolor = htfCol, text_size = size.small)
+
+    f_row(t, 2, "Momentum (" + str.tostring(emaF) + "/" + str.tostring(emaS) + ")", momoTxt, momoOn ? momoScore : 0)
+    f_row(t, 3, "RSI(" + str.tostring(rsiLen) + ")", str.tostring(rsi, "#.#"), rsiOn ? rsiScore : 0)
+    f_row(t, 4, "MACD", (macdLine > signalLine ? "Boğa" : "Ayı") + (histLine > histLine[1] ? " ↑" : " ↓"), macdOn ? macdScore : 0)
+    f_row(t, 5, "MA " + str.tostring(maFast) + "/" + str.tostring(maSlow), (close > ma50 and ma50 > ma200) ? "Golden dizilim" : close > ma50 ? "50MA üstü" : (close < ma200 and ma50 < ma200) ? "Death altı" : "50MA altı", maOn ? maScore : 0)
+    f_row(t, 6, "Hacim", volHigh ? (priceUp ? "Yüksek+Yükseliş" : "Yüksek+Düşüş") : "Normal", volOn ? volScore : 0)
+    f_row(t, 7, "CMF(" + str.tostring(cmfLen) + ")", str.tostring(cmf, "#.##"), cmfOn ? cmfScore : 0)
+    f_row(t, 8, "OBV", obvVal > obvEma ? "Yükseliyor" : "Düşüyor", obvOn ? obvScore : 0)
+    f_row(t, 9, "AVWAP (" + (avwapMode == "YTD" ? "YTD" : "manuel") + ")", na(avwap) ? "—" : (close > avwap ? "Üstünde" : "Altında"), vwapOn ? vwapScore : 0)
+    f_row(t, 10, "Bollinger", close >= bbUpper ? "Üst bant (güç)" : (close > bbBasis and close < bbUpper) ? "Orta-üst" : close <= bbLower ? "Alt bant (zayıf)" : "Orta-alt", bbOn ? bbScore : 0)
+
+    table.cell(t, 0, 11, "Sıkışma (squeeze)", text_color = txtDark, bgcolor = cellBg, text_halign = text.align_left, text_size = size.small)
+    table.cell(t, 1, 11, squeeze ? "VAR" : "YOK", text_color = txtDark, bgcolor = cellBg, text_halign = text.align_right, text_size = size.small)
+    table.cell(t, 2, 11, squeeze ? "⚡" : "·", text_color = txtLight, bgcolor = squeeze ? color.new(#9e8b00, 0) : color.new(#787b86, 0), text_size = size.small)
+
+    table.cell(t, 0, 12, "TOPLAM SKOR", text_color = txtLight, bgcolor = darkBg, text_halign = text.align_left, text_size = size.small)
+    table.cell(t, 1, 12, str.tostring(total) + " / " + str.tostring(maxPossible), text_color = txtLight, bgcolor = darkBg, text_halign = text.align_right, text_size = size.small)
+    table.cell(t, 2, 12, "", bgcolor = darkBg)
+
+    table.cell(t, 0, 13, "KARAR", text_color = txtLight, bgcolor = verdictCol, text_halign = text.align_left, text_size = size.normal)
+    table.cell(t, 1, 13, verdict, text_color = txtLight, bgcolor = verdictCol, text_halign = text.align_right, text_size = size.normal)
+    table.cell(t, 2, 13, "", bgcolor = verdictCol)
+
+    table.cell(t, 0, 14, "📍 SEVİYELER (hacim)", text_color = txtLight, bgcolor = darkBg, text_halign = text.align_left, text_size = size.small)
+    table.cell(t, 1, 14, "~" + str.tostring(vpLook) + " bar", text_color = txtLight, bgcolor = darkBg, text_halign = text.align_right, text_size = size.small)
+    table.cell(t, 2, 14, "", bgcolor = darkBg)
+
+    f_info(t, 15, "Güncel fiyat", str.tostring(close, format.mintick), color.new(#787b86, 0))
+    f_info(t, 16, "Direnç (yoğun hacim)", na(resVol) ? "—" : str.tostring(resVol, format.mintick), color.new(#c0362c, 0))
+    f_info(t, 17, "POC (ana zemin)", na(pocLevel) ? "—" : str.tostring(pocLevel, format.mintick), color.new(#2962ff, 0))
+    f_info(t, 18, "Destek (yoğun hacim)", na(supVol) ? "—" : str.tostring(supVol, format.mintick), color.new(#0b8043, 0))
+    f_info(t, 19, "Stop (Chandelier " + str.tostring(atrMult, "#.#") + "xATR)", str.tostring(chandStop, format.mintick) + " (" + str.tostring(stopDistPct, "#.#") + "%)", color.new(#e8830c, 0))
+
+    table.cell(t, 0, 20, "POC konumu", text_color = txtDark, bgcolor = cellBg, text_halign = text.align_left, text_size = size.small)
+    table.cell(t, 1, 20, valTxt, text_color = txtDark, bgcolor = cellBg, text_halign = text.align_right, text_size = size.small)
+    table.cell(t, 2, 20, "", bgcolor = valCol)
+
+// ---------------------------------------------------------------------------
+//  ALARMLAR
+// ---------------------------------------------------------------------------
+buySignal    = ta.crossover(total, buyTh)
+strongSignal = ta.crossover(total, strongBuyTh)
+exitSignal   = ta.crossunder(total, avoidTh)
+goldenSetup  = htfScore == 1 and ta.crossover(total, buyTh)
+
+alertcondition(buySignal,    "Kademeli AL sinyali", "{{ticker}} — Giriş skoru KADEMELİ AL eşiğini geçti")
+alertcondition(strongSignal, "GÜÇLÜ AL sinyali",    "{{ticker}} — Giriş skoru GÜÇLÜ AL eşiğini geçti")
+alertcondition(exitSignal,   "ÇIK / KAÇIN sinyali", "{{ticker}} — Giriş skoru ÇIK/KAÇIN bölgesine düştü")
+alertcondition(goldenSetup,  "ALTIN KURULUM",       "{{ticker}} — Üst trend YUKARI iken giriş AL eşiğini geçti")
+
+stopBreak = ta.crossunder(close, chandStop)
+alertcondition(stopBreak, "Chandelier STOP kırıldı", "{{ticker}} — fiyat ATR Chandelier stop'unu aşağı kırdı (çıkış)")
