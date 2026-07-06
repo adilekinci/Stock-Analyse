@@ -1,6 +1,6 @@
 //@version=6
 // ============================================================================
-//  GİRİŞ ZAMANI DEĞERLENDİRMESİ — Adil  (v6: ATR Chandelier stop)
+//  GİRİŞ ZAMANI DEĞERLENDİRMESİ — Adil  (v6.4: sabit taban - tüm geçmiş referanslı)
 //  Uzun vadeli. Tek soru: "Trend hissesine ŞU AN girmeli miyim?"
 //
 //  v5 DÜZELTMELERİ (guru eleştirisi):
@@ -14,7 +14,7 @@
 //  Hacim seviyeleri & AVWAP & POC oya KARIŞMAZ (bağlam). Stop = bağlam/çıkış.
 // ============================================================================
 
-indicator("Giriş Zamanı Değerlendirmesi — Adil v6", overlay = true, max_lines_count = 50)
+indicator("Giriş Zamanı Değerlendirmesi — Adil v6.4", overlay = true, max_lines_count = 50)
 
 // ---------------------------------------------------------------------------
 //  AYARLAR
@@ -216,6 +216,17 @@ valTxt = na(pocLevel) ? "—" : close > pocLevel * 1.01 ? "POC ÜSTÜ — zemin 
 valCol = na(pocLevel) ? color.new(#787b86,20) : close > pocLevel * 1.01 ? color.new(#0b8043,0) : close < pocLevel * 0.99 ? color.new(#c0362c,0) : color.new(#9e8b00,0)
 
 // ---------------------------------------------------------------------------
+//  5) TEMEL ANALİZ (Fundamentals) — yalnız BAĞLAM, oya KARIŞMAZ, yargı etiketi YOK
+//      P/E doğrudan çekilemez; EPS çekilip canlı fiyatla hesaplanır (resmi yöntem).
+//      Pay (fiyat) canlı, payda (EPS) çeyreklik donar. Yargı yok -> sen yorumla.
+// ---------------------------------------------------------------------------
+eps_ttm = request.financial(syminfo.tickerid, "EARNINGS_PER_SHARE", "TTM", ignore_invalid_symbol = true)
+pe_ttm  = (not na(eps_ttm) and eps_ttm > 0) ? close / eps_ttm : na
+peStr   = na(eps_ttm) ? "Veri Yok" : eps_ttm <= 0 ? "Zararda (EPS<0)" : str.tostring(pe_ttm, "#.#")
+epsStr  = na(eps_ttm) ? "—" : str.tostring(eps_ttm, "#.##")
+fundCol = color.new(#546e7a, 0)   // nötr (yargı bildirmez)
+
+// ---------------------------------------------------------------------------
 //  ÇİZGİLER + ARKA PLAN
 // ---------------------------------------------------------------------------
 bgcolor(bgTint ? color.new(verdictCol, 92) : na)
@@ -226,6 +237,30 @@ plot(showEma ? ema21 : na, "21 EMA", color = color.new(#9c27b0, 0), linewidth = 
 plot(vwapOn ? avwap : na, "AVWAP", color = color.new(color.fuchsia, 0), linewidth = 1)
 // Chandelier stop: sürekli merdiven çizgi (trailing stop görünür olsun)
 plot(chandStop, "Chandelier Stop (ATR)", color = color.new(#e8830c, 0), linewidth = 2, style = plot.style_stepline)
+
+// ---------------------------------------------------------------------------
+//  HACİM BARLARI — grafiğin altında (overlay, ölçeklenmiş)
+//  Yüksek hacim (RVOL patlaması) koyu; normal hacim soluk. Yükseliş=yeşil, düşüş=kırmızı.
+// ---------------------------------------------------------------------------
+grpVB       = "Hacim Barları (altta)"
+showVolBars = input.bool(true,  "Hacmi altta göster",       group = grpVB)
+volFrac     = input.float(0.20, "Yükseklik oranı (chart)",  group = grpVB, minval = 0.05, maxval = 0.6, step = 0.05)
+volMaxLen   = input.int(250,    "Hacim normalizasyon penceresi (bar)", group = grpVB, minval = 20, tooltip = "Yükseklik ölçeği için (barların TABANI değil, sadece boy oranı).")
+
+// SABİT taban: TÜM grafik geçmişinin en dip/en tepesi (kayan pencere DEĞİL) -> gerçek düz çizgi.
+var float allTimeLow  = na
+var float allTimeHigh = na
+allTimeLow  := na(allTimeLow)  ? low  : math.min(allTimeLow, low)
+allTimeHigh := na(allTimeHigh) ? high : math.max(allTimeHigh, high)
+vbRngFull = allTimeHigh - allTimeLow
+vbBase    = allTimeLow - vbRngFull * 0.02      // sabit taban, tüm geçmiş boyunca hiç değişmez
+
+vbMax  = ta.highest(volume, volMaxLen)          // sadece YÜKSEKLİK ölçeği için, taban etkilenmez
+vbNorm = vbMax != 0 ? volume / vbMax : 0.0
+vbTop  = vbBase + vbNorm * vbRngFull * volFrac
+vbUp   = close >= open
+vbCol  = vbUp ? (volHigh ? color.new(#0b8043, 0) : color.new(#26a69a, 55)) : (volHigh ? color.new(#c0362c, 0) : color.new(#ef5350, 55))
+plotcandle(showVolBars ? vbBase : na, showVolBars ? vbTop : na, showVolBars ? vbBase : na, showVolBars ? vbTop : na, title = "Hacim barları", color = vbCol, wickcolor = vbCol, bordercolor = vbCol)
 
 var line pocLine = na
 var line resLine = na
@@ -248,7 +283,7 @@ if barstate.islast and showLines
 //  TABLO
 // ---------------------------------------------------------------------------
 posMap = tblPos == "top_left" ? position.top_left : tblPos == "bottom_right" ? position.bottom_right : tblPos == "bottom_left" ? position.bottom_left : tblPos == "middle_right" ? position.middle_right : position.top_right
-var table t = table.new(posMap, 3, 21, border_width = 1, frame_width = 1, frame_color = color.new(color.gray, 50))
+var table t = table.new(posMap, 3, 24, border_width = 1, frame_width = 1, frame_color = color.new(color.gray, 50))
 
 f_row(_t, _r, _lbl, _val, _sc) =>
     col = _sc > 0 ? color.new(#26a69a, 0) : _sc < 0 ? color.new(#ef5350, 0) : color.new(#787b86, 0)
@@ -306,6 +341,13 @@ if barstate.islast
     table.cell(t, 0, 20, "POC konumu", text_color = txtDark, bgcolor = cellBg, text_halign = text.align_left, text_size = size.small)
     table.cell(t, 1, 20, valTxt, text_color = txtDark, bgcolor = cellBg, text_halign = text.align_right, text_size = size.small)
     table.cell(t, 2, 20, "", bgcolor = valCol)
+
+    // --- TEMEL ANALİZ bloğu (bağlam, oya katılmaz) ---
+    table.cell(t, 0, 21, "🏢 TEMEL ANALİZ (TTM)", text_color = txtLight, bgcolor = darkBg, text_halign = text.align_left, text_size = size.small)
+    table.cell(t, 1, 21, "bağlam — oya katılmaz", text_color = txtLight, bgcolor = darkBg, text_halign = text.align_right, text_size = size.small)
+    table.cell(t, 2, 21, "", bgcolor = darkBg)
+    f_info(t, 22, "P/E (F/K, canlı fiyat)", peStr, fundCol)
+    f_info(t, 23, "Hisse başı kâr (EPS)", epsStr, fundCol)
 
 // ---------------------------------------------------------------------------
 //  ALARMLAR
