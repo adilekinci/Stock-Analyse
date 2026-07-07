@@ -1,6 +1,6 @@
 //@version=6
 // ============================================================================
-//  GİRİŞ ZAMANI DEĞERLENDİRMESİ — Adil  (v6.4: sabit taban - tüm geçmiş referanslı)
+//  GİRİŞ ZAMANI DEĞERLENDİRMESİ — Adil  (v7: MACD sıfır hattı + koşullu squeeze + otomatik endeks rejimi)
 //  Uzun vadeli. Tek soru: "Trend hissesine ŞU AN girmeli miyim?"
 //
 //  v5 DÜZELTMELERİ (guru eleştirisi):
@@ -14,7 +14,7 @@
 //  Hacim seviyeleri & AVWAP & POC oya KARIŞMAZ (bağlam). Stop = bağlam/çıkış.
 // ============================================================================
 
-indicator("Giriş Zamanı Değerlendirmesi — Adil v6.4", overlay = true, max_lines_count = 50)
+indicator("Giriş Zamanı Değerlendirmesi — Adil v7", overlay = true, max_lines_count = 50)
 
 // ---------------------------------------------------------------------------
 //  AYARLAR
@@ -49,6 +49,10 @@ grpStop = "Dinamik Stop (Chandelier ATR)"
 atrLen  = input.int(22,  "ATR / tepe periyodu", group = grpStop, minval = 2, tooltip = "Standart Chandelier = 22. ATR hem volatilite hem tepe penceresi.")
 atrMult = input.float(3.0,"ATR çarpanı",        group = grpStop, step = 0.1, tooltip = "Uzan vade için 3x dengeli. Büyütürsen stop genişler (geç çıkış).")
 
+grpRg  = "Piyasa Rejimi (endeks filtresi)"
+idxMode   = input.string("Otomatik", "Endeks seçimi", options = ["Otomatik","QQQ (Nasdaq)","SPY (S&P 500)","DAX","Manuel"], group = grpRg, tooltip = "Otomatik: hissenin borsasına göre seçer (NASDAQ→QQQ, NYSE→SPY, Xetra→DAX, diğer→SPY).")
+idxCustom = input.symbol("AMEX:SPY", "Manuel endeks sembolü", group = grpRg)
+
 grpT   = "Göstergeyi Skora Kat (aç/kapa)"
 momoOn = input.bool(true,  "Momentum (8/21) ±1", group = grpT)
 rsiOn  = input.bool(true,  "RSI ±2",        group = grpT)
@@ -59,6 +63,7 @@ cmfOn  = input.bool(true,  "CMF ±2",        group = grpT)
 obvOn  = input.bool(true,  "OBV ±1",        group = grpT)
 vwapOn = input.bool(true,  "AVWAP ±1",      group = grpT)
 bbOn   = input.bool(true,  "Bollinger ±2",  group = grpT)
+sqzOn  = input.bool(true,  "Squeeze +1 (koşullu)", group = grpT, tooltip = "Sıkışma VAR ve fiyat orta bandın üstündeyse +1. Yönsüz sıkışmaya puan verilmez.")
 
 grpV   = "Görünüm"
 tblPos = input.string("top_right", "Tablo konumu", options = ["top_right","top_left","bottom_right","bottom_left","middle_right"], group = grpV)
@@ -83,6 +88,21 @@ f_htf() =>
 htfScore = na(htfMa50) ? na : na(htfMa200) ? (htfClose > htfMa50 ? 1 : -1) : (htfClose > htfMa50 and htfMa50 > htfMa200) ? 1 : (htfClose < htfMa200 and htfMa50 < htfMa200) ? -1 : 0
 htfTxt = na(htfScore) ? "—" : htfScore == 1 ? "🟢 Yukarı" : htfScore == -1 ? "🔴 Aşağı" : "🟡 Karışık"
 htfCol = na(htfScore) ? color.new(#787b86, 20) : htfScore == 1 ? color.new(#0b8043, 0) : htfScore == -1 ? color.new(#c0362c, 0) : color.new(#9e8b00, 0)
+
+// ---------------------------------------------------------------------------
+//  1b) PİYASA REJİMİ — borsa endeksi 200 günlük MA üstü mü? (bağlam, oya karışmaz)
+//      "Endeks sürünürken hissede kahramanlık yapılmaz."
+// ---------------------------------------------------------------------------
+idxAuto = syminfo.prefix == "NASDAQ" ? "NASDAQ:QQQ" : (syminfo.prefix == "XETR" or syminfo.prefix == "FWB" or syminfo.prefix == "GETTEX" ? "XETR:DAX" : "AMEX:SPY")
+idxSym  = idxMode == "Otomatik" ? idxAuto : idxMode == "QQQ (Nasdaq)" ? "NASDAQ:QQQ" : idxMode == "SPY (S&P 500)" ? "AMEX:SPY" : idxMode == "DAX" ? "XETR:DAX" : idxCustom
+f_idx() =>
+    [close, ta.sma(close, 200)]
+[idxClose, idxMa200] = request.security(idxSym, "D", f_idx(), lookahead = barmerge.lookahead_off, ignore_invalid_symbol = true)
+// Durum int olarak tutulur (v6 tip sistemi: na() bool'a uygulanamaz): 1=Risk-ON, -1=Risk-OFF, 0=veri yok
+regimeState = na(idxClose) or na(idxMa200) ? 0 : idxClose > idxMa200 ? 1 : -1
+idxShort  = str.contains(idxSym, ":") ? array.get(str.split(idxSym, ":"), 1) : idxSym
+regimeTxt = regimeState == 0 ? "Veri yok" : regimeState == 1 ? "🟢 Risk-ON (200MA üstü)" : "🔴 Risk-OFF (200MA altı)"
+regimeCol = regimeState == 0 ? color.new(#787b86, 20) : regimeState == 1 ? color.new(#0b8043, 0) : color.new(#c0362c, 0)
 
 // ---------------------------------------------------------------------------
 //  2) MOMENTUM (8/21) — yön kümesi, ağırlık ±1
@@ -130,8 +150,8 @@ volHigh = volume > volAvg * volMult
 // === TREND-ONAYLAYAN SKORLAR (v5: gücü al, zayıflığı değil) ===
 // RSI: 50-65 sağlam trend (+2), >65 aşırı alım ama pozitif (+1), 40-50 nötr, <40 zayıf, <30 çöp.
 rsiScore  = rsi > 65 ? 1 : rsi > 50 ? 2 : rsi > 40 ? 0 : rsi > 30 ? -1 : -2
-// MACD: ±1 (collinearity ↓)
-macdScore = macdLine > signalLine ? 1 : -1
+// MACD: sıfır hattı + sinyal (v7, guru): 0 üstü VE sinyal üstü = +1; 0 altı VE sinyal altı = -1; karışık = 0.
+macdScore = macdLine > 0 and macdLine > signalLine ? 1 : macdLine < 0 and macdLine < signalLine ? -1 : 0
 // MA dizilim: ±2 (yapısal çapa)
 maScore   = (close > ma50 and ma50 > ma200) ? 2 : (close > ma50) ? 1 : (close < ma200 and ma50 < ma200) ? -2 : -1
 volScore  = volHigh ? (priceUp ? 1 : -1) : 0
@@ -140,6 +160,8 @@ obvScore  = obvVal > obvEma ? 1 : -1
 vwapScore = na(avwap) ? 0 : (close > avwap ? 1 : -1)
 // Bollinger: üst bant = güç (+2), orta-üst tutunma (+1), orta-alt (-1), alt bant = zayıf (-2)
 bbScore   = close >= bbUpper ? 2 : (close > bbBasis and close < bbUpper) ? 1 : close <= bbLower ? -2 : -1
+// Squeeze (v7): sıkışma VAR + fiyat orta bandın ÜSTÜNDE (yukarı eğilim) -> +1; aksi halde 0. Yönsüz sıkışmaya puan yok.
+sqzScore  = squeeze and close > bbBasis ? 1 : 0
 
 momoS = momoOn ? momoScore : 0
 rsiS  = rsiOn  ? rsiScore  : 0
@@ -150,9 +172,10 @@ cmfS  = cmfOn  ? cmfScore  : 0
 obvS  = obvOn  ? obvScore  : 0
 vwapS = vwapOn ? vwapScore : 0
 bbS   = bbOn   ? bbScore   : 0
-total = momoS + rsiS + macdS + maS + volS + cmfS + obvS + vwapS + bbS
+sqzS  = sqzOn  ? sqzScore  : 0
+total = momoS + rsiS + macdS + maS + volS + cmfS + obvS + vwapS + bbS + sqzS
 
-maxPossible = (momoOn?1:0)+(rsiOn?2:0)+(macdOn?1:0)+(maOn?2:0)+(volOn?1:0)+(cmfOn?2:0)+(obvOn?1:0)+(vwapOn?1:0)+(bbOn?2:0)
+maxPossible = (momoOn?1:0)+(rsiOn?2:0)+(macdOn?1:0)+(maOn?2:0)+(volOn?1:0)+(cmfOn?2:0)+(obvOn?1:0)+(vwapOn?1:0)+(bbOn?2:0)+(sqzOn?1:0)
 strongBuyTh = maxPossible * 0.55
 buyTh       = maxPossible * 0.25
 waitTh      = -maxPossible * 0.15
@@ -283,7 +306,7 @@ if barstate.islast and showLines
 //  TABLO
 // ---------------------------------------------------------------------------
 posMap = tblPos == "top_left" ? position.top_left : tblPos == "bottom_right" ? position.bottom_right : tblPos == "bottom_left" ? position.bottom_left : tblPos == "middle_right" ? position.middle_right : position.top_right
-var table t = table.new(posMap, 3, 24, border_width = 1, frame_width = 1, frame_color = color.new(color.gray, 50))
+var table t = table.new(posMap, 3, 25, border_width = 1, frame_width = 1, frame_color = color.new(color.gray, 50))
 
 f_row(_t, _r, _lbl, _val, _sc) =>
     col = _sc > 0 ? color.new(#26a69a, 0) : _sc < 0 ? color.new(#ef5350, 0) : color.new(#787b86, 0)
@@ -306,48 +329,51 @@ if barstate.islast
     table.cell(t, 1, 1, htfTxt, text_color = txtDark, bgcolor = cellBg, text_halign = text.align_right, text_size = size.small)
     table.cell(t, 2, 1, na(htfScore) ? "·" : htfScore == 1 ? "✅" : htfScore == -1 ? "❌" : "➖", text_color = txtLight, bgcolor = htfCol, text_size = size.small)
 
-    f_row(t, 2, "Momentum (" + str.tostring(emaF) + "/" + str.tostring(emaS) + ")", momoTxt, momoOn ? momoScore : 0)
-    f_row(t, 3, "RSI(" + str.tostring(rsiLen) + ")", str.tostring(rsi, "#.#"), rsiOn ? rsiScore : 0)
-    f_row(t, 4, "MACD", (macdLine > signalLine ? "Boğa" : "Ayı") + (histLine > histLine[1] ? " ↑" : " ↓"), macdOn ? macdScore : 0)
-    f_row(t, 5, "MA " + str.tostring(maFast) + "/" + str.tostring(maSlow), (close > ma50 and ma50 > ma200) ? "Golden dizilim" : close > ma50 ? "50MA üstü" : (close < ma200 and ma50 < ma200) ? "Death altı" : "50MA altı", maOn ? maScore : 0)
-    f_row(t, 6, "Hacim", volHigh ? (priceUp ? "Yüksek+Yükseliş" : "Yüksek+Düşüş") : "Normal", volOn ? volScore : 0)
-    f_row(t, 7, "CMF(" + str.tostring(cmfLen) + ")", str.tostring(cmf, "#.##"), cmfOn ? cmfScore : 0)
-    f_row(t, 8, "OBV", obvVal > obvEma ? "Yükseliyor" : "Düşüyor", obvOn ? obvScore : 0)
-    f_row(t, 9, "AVWAP (" + (avwapMode == "YTD" ? "YTD" : "manuel") + ")", na(avwap) ? "—" : (close > avwap ? "Üstünde" : "Altında"), vwapOn ? vwapScore : 0)
-    f_row(t, 10, "Bollinger", close >= bbUpper ? "Üst bant (güç)" : (close > bbBasis and close < bbUpper) ? "Orta-üst" : close <= bbLower ? "Alt bant (zayıf)" : "Orta-alt", bbOn ? bbScore : 0)
+    // Piyasa rejimi (bağlam — oya karışmaz)
+    table.cell(t, 0, 2, "Endeks rejimi (" + idxShort + ")", text_color = txtDark, bgcolor = cellBg, text_halign = text.align_left, text_size = size.small)
+    table.cell(t, 1, 2, regimeTxt, text_color = txtDark, bgcolor = cellBg, text_halign = text.align_right, text_size = size.small)
+    table.cell(t, 2, 2, regimeState == 0 ? "·" : regimeState == 1 ? "✅" : "❌", text_color = txtLight, bgcolor = regimeCol, text_size = size.small)
 
-    table.cell(t, 0, 11, "Sıkışma (squeeze)", text_color = txtDark, bgcolor = cellBg, text_halign = text.align_left, text_size = size.small)
-    table.cell(t, 1, 11, squeeze ? "VAR" : "YOK", text_color = txtDark, bgcolor = cellBg, text_halign = text.align_right, text_size = size.small)
-    table.cell(t, 2, 11, squeeze ? "⚡" : "·", text_color = txtLight, bgcolor = squeeze ? color.new(#9e8b00, 0) : color.new(#787b86, 0), text_size = size.small)
+    f_row(t, 3, "Momentum (" + str.tostring(emaF) + "/" + str.tostring(emaS) + ")", momoTxt, momoOn ? momoScore : 0)
+    f_row(t, 4, "RSI(" + str.tostring(rsiLen) + ")", str.tostring(rsi, "#.#"), rsiOn ? rsiScore : 0)
+    f_row(t, 5, "MACD (0 hattı)", (macdLine > 0 ? "0 üstü" : "0 altı") + (macdLine > signalLine ? " · Boğa" : " · Ayı"), macdOn ? macdScore : 0)
+    f_row(t, 6, "MA " + str.tostring(maFast) + "/" + str.tostring(maSlow), (close > ma50 and ma50 > ma200) ? "Golden dizilim" : close > ma50 ? "50MA üstü" : (close < ma200 and ma50 < ma200) ? "Death altı" : "50MA altı", maOn ? maScore : 0)
+    f_row(t, 7, "Hacim", volHigh ? (priceUp ? "Yüksek+Yükseliş" : "Yüksek+Düşüş") : "Normal", volOn ? volScore : 0)
+    f_row(t, 8, "CMF(" + str.tostring(cmfLen) + ")", str.tostring(cmf, "#.##"), cmfOn ? cmfScore : 0)
+    f_row(t, 9, "OBV", obvVal > obvEma ? "Yükseliyor" : "Düşüyor", obvOn ? obvScore : 0)
+    f_row(t, 10, "AVWAP (" + (avwapMode == "YTD" ? "YTD" : "manuel") + ")", na(avwap) ? "—" : (close > avwap ? "Üstünde" : "Altında"), vwapOn ? vwapScore : 0)
+    f_row(t, 11, "Bollinger", close >= bbUpper ? "Üst bant (güç)" : (close > bbBasis and close < bbUpper) ? "Orta-üst" : close <= bbLower ? "Alt bant (zayıf)" : "Orta-alt", bbOn ? bbScore : 0)
 
-    table.cell(t, 0, 12, "TOPLAM SKOR", text_color = txtLight, bgcolor = darkBg, text_halign = text.align_left, text_size = size.small)
-    table.cell(t, 1, 12, str.tostring(total) + " / " + str.tostring(maxPossible), text_color = txtLight, bgcolor = darkBg, text_halign = text.align_right, text_size = size.small)
-    table.cell(t, 2, 12, "", bgcolor = darkBg)
+    f_row(t, 12, "Sıkışma (squeeze)", squeeze ? (close > bbBasis ? "VAR + yukarı eğilim ⚡" : "VAR (yönsüz)") : "YOK", sqzOn ? sqzScore : 0)
 
-    table.cell(t, 0, 13, "KARAR", text_color = txtLight, bgcolor = verdictCol, text_halign = text.align_left, text_size = size.normal)
-    table.cell(t, 1, 13, verdict, text_color = txtLight, bgcolor = verdictCol, text_halign = text.align_right, text_size = size.normal)
-    table.cell(t, 2, 13, "", bgcolor = verdictCol)
+    table.cell(t, 0, 13, "TOPLAM SKOR", text_color = txtLight, bgcolor = darkBg, text_halign = text.align_left, text_size = size.small)
+    table.cell(t, 1, 13, str.tostring(total) + " / " + str.tostring(maxPossible), text_color = txtLight, bgcolor = darkBg, text_halign = text.align_right, text_size = size.small)
+    table.cell(t, 2, 13, "", bgcolor = darkBg)
 
-    table.cell(t, 0, 14, "📍 SEVİYELER (hacim)", text_color = txtLight, bgcolor = darkBg, text_halign = text.align_left, text_size = size.small)
-    table.cell(t, 1, 14, "~" + str.tostring(vpLook) + " bar", text_color = txtLight, bgcolor = darkBg, text_halign = text.align_right, text_size = size.small)
-    table.cell(t, 2, 14, "", bgcolor = darkBg)
+    table.cell(t, 0, 14, "KARAR", text_color = txtLight, bgcolor = verdictCol, text_halign = text.align_left, text_size = size.normal)
+    table.cell(t, 1, 14, verdict, text_color = txtLight, bgcolor = verdictCol, text_halign = text.align_right, text_size = size.normal)
+    table.cell(t, 2, 14, "", bgcolor = verdictCol)
 
-    f_info(t, 15, "Güncel fiyat", str.tostring(close, format.mintick), color.new(#787b86, 0))
-    f_info(t, 16, "Direnç (yoğun hacim)", na(resVol) ? "—" : str.tostring(resVol, format.mintick), color.new(#c0362c, 0))
-    f_info(t, 17, "POC (ana zemin)", na(pocLevel) ? "—" : str.tostring(pocLevel, format.mintick), color.new(#2962ff, 0))
-    f_info(t, 18, "Destek (yoğun hacim)", na(supVol) ? "—" : str.tostring(supVol, format.mintick), color.new(#0b8043, 0))
-    f_info(t, 19, "Stop (Chandelier " + str.tostring(atrMult, "#.#") + "xATR)", str.tostring(chandStop, format.mintick) + " (" + str.tostring(stopDistPct, "#.#") + "%)", color.new(#e8830c, 0))
+    table.cell(t, 0, 15, "📍 SEVİYELER (hacim)", text_color = txtLight, bgcolor = darkBg, text_halign = text.align_left, text_size = size.small)
+    table.cell(t, 1, 15, "~" + str.tostring(vpLook) + " bar", text_color = txtLight, bgcolor = darkBg, text_halign = text.align_right, text_size = size.small)
+    table.cell(t, 2, 15, "", bgcolor = darkBg)
 
-    table.cell(t, 0, 20, "POC konumu", text_color = txtDark, bgcolor = cellBg, text_halign = text.align_left, text_size = size.small)
-    table.cell(t, 1, 20, valTxt, text_color = txtDark, bgcolor = cellBg, text_halign = text.align_right, text_size = size.small)
-    table.cell(t, 2, 20, "", bgcolor = valCol)
+    f_info(t, 16, "Güncel fiyat", str.tostring(close, format.mintick), color.new(#787b86, 0))
+    f_info(t, 17, "Direnç (yoğun hacim)", na(resVol) ? "—" : str.tostring(resVol, format.mintick), color.new(#c0362c, 0))
+    f_info(t, 18, "POC (ana zemin)", na(pocLevel) ? "—" : str.tostring(pocLevel, format.mintick), color.new(#2962ff, 0))
+    f_info(t, 19, "Destek (yoğun hacim)", na(supVol) ? "—" : str.tostring(supVol, format.mintick), color.new(#0b8043, 0))
+    f_info(t, 20, "Stop (Chandelier " + str.tostring(atrMult, "#.#") + "xATR)", str.tostring(chandStop, format.mintick) + " (" + str.tostring(stopDistPct, "#.#") + "%)", color.new(#e8830c, 0))
+
+    table.cell(t, 0, 21, "POC konumu", text_color = txtDark, bgcolor = cellBg, text_halign = text.align_left, text_size = size.small)
+    table.cell(t, 1, 21, valTxt, text_color = txtDark, bgcolor = cellBg, text_halign = text.align_right, text_size = size.small)
+    table.cell(t, 2, 21, "", bgcolor = valCol)
 
     // --- TEMEL ANALİZ bloğu (bağlam, oya katılmaz) ---
-    table.cell(t, 0, 21, "🏢 TEMEL ANALİZ (TTM)", text_color = txtLight, bgcolor = darkBg, text_halign = text.align_left, text_size = size.small)
-    table.cell(t, 1, 21, "bağlam — oya katılmaz", text_color = txtLight, bgcolor = darkBg, text_halign = text.align_right, text_size = size.small)
-    table.cell(t, 2, 21, "", bgcolor = darkBg)
-    f_info(t, 22, "P/E (F/K, canlı fiyat)", peStr, fundCol)
-    f_info(t, 23, "Hisse başı kâr (EPS)", epsStr, fundCol)
+    table.cell(t, 0, 22, "🏢 TEMEL ANALİZ (TTM)", text_color = txtLight, bgcolor = darkBg, text_halign = text.align_left, text_size = size.small)
+    table.cell(t, 1, 22, "bağlam — oya katılmaz", text_color = txtLight, bgcolor = darkBg, text_halign = text.align_right, text_size = size.small)
+    table.cell(t, 2, 22, "", bgcolor = darkBg)
+    f_info(t, 23, "P/E (F/K, canlı fiyat)", peStr, fundCol)
+    f_info(t, 24, "Hisse başı kâr (EPS)", epsStr, fundCol)
 
 // ---------------------------------------------------------------------------
 //  ALARMLAR
