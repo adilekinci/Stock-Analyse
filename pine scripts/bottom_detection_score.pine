@@ -1,0 +1,323 @@
+// Bottom Detection Score (BDS) v2
+// Tek soru: "Bu düşüş bitti mi, taban oluşuyor mu?"
+// Entry Timing Score'dan bağımsızdır ve ondan ÖNCEKİ aşamayı ölçer:
+// Stage 4 -> Stage 1 geçişi. BDS "taban teyitli" dediğinde
+// giriş kararı yine Entry Timing Score'a aittir.
+//
+// TASARIM NOTLARI:
+// - Taban bir "an" değil "süreç" olduğu için kapitülasyon ve diverjans
+//   sinyalleri hafıza penceresi boyunca geçerli sayılır (persistent).
+// - GEÇERSİZLEŞTİRME YAPISALDIR, ZAMANSAL DEĞİL: kapitülasyon dibi,
+//   higher low dibi veya diverjans dibi KIRILIRSA ilgili puan anında
+//   iptal olur — süre dolmasa bile. Yapı bozulduysa puan yok.
+// - Günlük grafik için tasarlandı. SMA150 (günlük) ~ SMA30 (haftalık),
+//   yani Weinstein'ın klasik taban kriteri.
+// - Heikin Ashi grafikte skorlar GEÇERSİZDİR; script uyarı verir.
+//
+// Testler sırasıyla şunlar, günlük hayat diliyle:
+
+//1.Büyük panik yaşandı mı? Düşüşler genelde herkesin aynı anda "yeter, satıyorum!" dediği bir panik günüyle biter. O gün işlem hacmi normalin 3 katına çıkar, fiyat sert düşer. Kulağa kötü gelir ama aslında iyi işarettir: satmak isteyen herkes satmıştır, satacak kimse kalmamıştır. Script bu panik gününü arar ve bulursa grafiğe "CAP" diye işaret koyar.
+//2.Fiyat düştüğünde eskisi kadar derin düşüyor mu? Hisse tekrar geriler ama bir önceki dibin üstünde durursa ve bu sefer daha az kişi satıyorsa, satıcılar yoruluyor demektir. Denize atılan topun her seferinde daha az batması gibi.
+//3.Fiyat düşerken "düşüş gücü" azalıyor mu? Fiyat yeni bir dip yapar ama motorun gücünü ölçen gösterge (RSI) artık eskisi kadar düşmez. Araba hâlâ yokuş aşağı gidiyor ama gaz kesilmiş — momentum bitiyor.
+//4.Uzun vadeli ortalama yataylaştı mı? Son 150 günün ortalama fiyatını gösteren bir çizgi var. Bu çizgi hâlâ dik aşağı bakıyorsa düşüş yapısal olarak sürüyor demektir; yataylaşmaya başladıysa gemi dönüyor demektir. Bu, en yavaş ama en güvenilir testtir.
+//5.Hisse artık borsanın genelinden daha kötü değil mi? Bütün borsa düşerken bu hisse yerinde sayıyorsa, birileri sessizce topluyor demektir. Herkes kaçarken alan o "birileri" genelde büyük kurumsal paradır.
+//6.Fiyat bir süredir sakin bir bantta mı geziniyor? Gerçek dipler bir günde oluşmaz; fiyatın 6-12 hafta boyunca dar bir aralıkta sıkışıp "dinlenmesi" gerekir. Fırtınadan sonra denizin durulması gibi.
+
+//Puanın anlamı:
+//0-2: Düşüş sürüyor. Uzak dur, "ucuz göründü" diye alma.
+//3: Duraklamış olabilir ama kanıt yetersiz. Sadece izle.
+//4-5: Taban oluşuyor. Hâlâ alım zamanı değil, ama hisse artık ciddi izleme listesinde.
+//6: Taban büyük ihtimalle tamamlandı. Şimdi sıra öbür scripte (Entry Timing Score) geçer — "ne zaman gireyim" sorusunu o cevaplar.
+//
+//@version=6
+indicator("Bottom Detection Score v3", shorttitle="BDS", overlay=false, max_bars_back=500, scale=scale.right)
+
+// ════════════════════════════════════════════════════════
+// INPUTS
+// ════════════════════════════════════════════════════════
+grpCap = "1 · Kapitülasyon (Selling Climax)"
+capRvol    = input.float(3.0, "RVOL eşiği", minval=1.5, step=0.5, group=grpCap, tooltip="Kapitülasyon günü hacmi, 50 günlük ortalama hacmin kaç katı olmalı")
+capAtrMult = input.float(1.5, "True Range / ATR14 çarpanı", minval=1.0, step=0.1, group=grpCap, tooltip="Panik mumunun True Range'i (gap dahil) ATR'nin kaç katı olmalı")
+capMemory  = input.int(90, "Kapitülasyon hafızası (bar)", minval=20, group=grpCap, tooltip="Kapitülasyondan sonra sinyalin kaç bar geçerli sayılacağı")
+
+grpPiv = "2-3 · Higher Low & Diverjans"
+pivLen    = input.int(5, "Pivot sol/sağ bar sayısı", minval=2, group=grpPiv)
+divMemory = input.int(60, "Diverjans hafıza tavanı (bar)", minval=20, group=grpPiv, tooltip="Diverjans son dipte oluşur, higher low sonra gelir; bu yüzden hafızada tutulur. Asıl geçersizleştirme yapısaldır: diverjans dibi kırılırsa süreye bakılmaksızın puan iptal olur")
+
+grpMa = "4 · Yavaş MA Yataylaşması (Weinstein)"
+maLen      = input.int(150, "Yavaş SMA uzunluğu", group=grpMa, tooltip="Günlük 150 ≈ haftalık 30. Weinstein Stage 1 kriteri")
+slopeLen   = input.int(20, "Eğim ölçüm penceresi (bar)", group=grpMa)
+flatThresh = input.float(0.5, "Yataylık toleransı (%)", step=0.1, group=grpMa, tooltip="MA eğimi bu değerden daha az negatifse 'yataylaştı' sayılır")
+
+grpRs = "5 · Göreceli Güç (RS)"
+benchSym = input.symbol("SP:SPX", "Karşılaştırma endeksi (skorda kullanılır)", group=grpRs)
+benchSym2 = input.symbol("NASDAQ:NDX", "2. endeks (yalnızca görsel karşılaştırma)", group=grpRs, tooltip="Skora girmez; grafikte rebase edilmiş çizgi olarak gösterilir")
+rsMaLen  = input.int(20, "RS çizgisi SMA uzunluğu", group=grpRs)
+
+grpBase = "6 · Taban Süresi"
+baseLen      = input.int(30, "Minimum taban süresi (bar)", minval=10, group=grpBase, tooltip="V-dip nadirdir; 6-12 haftalık konsolidasyon aranır (30 bar ≈ 6 hafta)")
+useAtrRange  = input.bool(true, "Aralık limitini ATR'ye bağla (dinamik)", group=grpBase, tooltip="Açıkken limit = ATR% × çarpan. Volatil hissede geniş, sakin hissede dar tolerans. Kapalıysa sabit % kullanılır")
+baseAtrMult  = input.float(8.0, "ATR% çarpanı", minval=3.0, step=0.5, group=grpBase, tooltip="Örnek: ATR%=3 ise limit %24 olur. Not: taban ne kadar genişse istatistiksel olarak o kadar zayıftır (VCP mantığı) — bu bir tolerans, hedef değil")
+baseMaxRange = input.float(30.0, "Sabit maksimum aralık (%) [fallback]", step=1.0, group=grpBase, tooltip="ATR modu kapalıysa kullanılır")
+
+showTable  = input.bool(true, "Skor tablosunu göster", group="Görünüm")
+showShapes = input.bool(true, "Kapitülasyon işaretlerini göster", group="Görünüm")
+showVol      = input.bool(true, "Hacim kolonları (alt panel)", group="Görünüm", tooltip="Pencere maksimumunun yüzdesi olarak 0-100 ölçeğinde. Turuncu = kapitülasyon eşiği (RVOL >= eşik), koyu ton = RVOL >= 1.5")
+volLookback  = input.int(150, "Ölçekleme penceresi (bar)", minval=50, maxval=400, group="Görünüm", tooltip="Hacim normalizasyonu ve endeks rebase başlangıcı bu pencereye göre hesaplanır")
+showRsiBand  = input.bool(true, "RSI çizgisi (alt panel)", group="Görünüm", tooltip="Kriter 3'ün ham verisi. 30/70 seviyeleri noktalı çizgiyle işaretlenir")
+showIdxCompare = input.bool(true, "Endeks karşılaştırma çizgileri (ana grafik)", group="Görünüm", tooltip="Kriter 5'in ham verisi. Her iki endeks pencere başında hisse fiyatına rebase edilir: çizgi hissenin üstündeyse hisse endeksten geride kalmış demektir")
+
+// ════════════════════════════════════════════════════════
+// ORTAK HESAPLAR (her barda tutarlı çağrı için üst seviyede)
+// ════════════════════════════════════════════════════════
+atr14   = ta.atr(14)
+rsi14   = ta.rsi(close, 14)
+volMa50 = ta.sma(volume, 50)
+volMa3  = ta.sma(volume, 3)
+rvol    = volMa50 > 0 ? volume / volMa50 : na
+
+// ════════════════════════════════════════════════════════
+// KRİTER 1 · KAPİTÜLASYON HACMİ
+// Panik günü: kırmızı mum + RVOL >= eşik + geniş aralık.
+// Sinyal, hafıza penceresi boyunca ve fiyat panik dibinin
+// ÜSTÜNDE kaldığı sürece geçerli sayılır.
+// ════════════════════════════════════════════════════════
+// ta.tr önceki kapanışı da hesaba katar -> gap-down panikleri yakalanır.
+// atr14 zaten TR ortalaması olduğu için kıyas matematiksel olarak tutarlıdır.
+capBar = close < open and not na(rvol) and rvol >= capRvol and ta.tr >= capAtrMult * atr14
+
+var float capLow    = na
+var int   capBarIdx = na
+if capBar
+    capLow    := low
+    capBarIdx := bar_index
+
+capAge = na(capBarIdx) ? na : bar_index - capBarIdx
+// En az 5 bar geçmiş olmalı (panik gününün kendisi dip teyidi değildir)
+score1 = not na(capAge) and capAge >= 5 and capAge <= capMemory and close > capLow
+
+// ════════════════════════════════════════════════════════
+// KRİTER 2 · HIGHER LOW + HACİM ASİMETRİSİ
+// KRİTER 3 · POZİTİF RSI DİVERJANSI
+// Pivot dipler üzerinden. Diverjans genelde SON dipte oluşur,
+// higher low ondan SONRA gelir — bu yüzden diverjans tespiti
+// hafızada tutulur ki iki kriter aynı anda puanlanabilsin.
+// ════════════════════════════════════════════════════════
+pl = ta.pivotlow(low, pivLen, pivLen)
+
+var float lastPL    = na
+var float prevPL    = na
+var float lastPLvol = na
+var float prevPLvol = na
+var float lastPLrsi = na
+var float prevPLrsi = na
+var int   divBarIdx = na
+var float divLow    = na
+
+if not na(pl)
+    prevPL    := lastPL
+    prevPLvol := lastPLvol
+    prevPLrsi := lastPLrsi
+    lastPL    := pl
+    lastPLvol := volMa3[pivLen]
+    lastPLrsi := rsi14[pivLen]
+    // Diverjans: fiyat eşit/daha düşük dip, RSI daha yüksek dip
+    if not na(prevPL) and lastPL <= prevPL and not na(prevPLrsi) and lastPLrsi > prevPLrsi
+        divBarIdx := bar_index
+        divLow    := lastPL
+
+// YAPISAL GEÇERSİZLEŞTİRME (v2):
+// Pivot onayı pivLen bar gecikmeli gelir; fiyat bu arada son dibin
+// altına çakılırsa eski state hâlâ "higher low var" der. Bu yüzden:
+// yapı bozulduysa (close < son pivot dip) puan anında iptal.
+hlStructureIntact = not na(lastPL) and close > lastPL
+score2 = not na(prevPL) and lastPL > prevPL and not na(prevPLvol) and lastPLvol < prevPLvol and hlStructureIntact
+
+// Diverjans için de aynı prensip: geçersizleştirme zamansal değil
+// yapısaldır. Diverjans dibi tuttuğu sürece sinyal geçerli;
+// kırıldıysa süre dolmasa bile puan yok. Zaman tavanı emniyet kemeri.
+divAge = na(divBarIdx) ? na : bar_index - divBarIdx
+divStructureIntact = not na(divLow) and close > divLow
+score3 = not na(divAge) and divAge <= divMemory and divStructureIntact
+
+// ════════════════════════════════════════════════════════
+// KRİTER 4 · YAVAŞ MA YATAYLAŞMASI
+// MA hâlâ dik aşağı eğimliyken her "dip" falling knife adayıdır.
+// ════════════════════════════════════════════════════════
+maSlow   = ta.sma(close, maLen)
+slopePct = maSlow[slopeLen] > 0 ? (maSlow - maSlow[slopeLen]) / maSlow[slopeLen] * 100 : na
+score4   = not na(slopePct) and slopePct > -flatThresh
+
+// ════════════════════════════════════════════════════════
+// KRİTER 5 · GÖRECELİ GÜÇ DÖNÜŞÜ
+// RS çizgisi kendi ortalamasının üstüne çıktıysa hisse,
+// endekse göre düşmeyi bırakmış demektir (accumulation izi).
+// ════════════════════════════════════════════════════════
+benchClose = request.security(benchSym, timeframe.period, close, barmerge.gaps_off, barmerge.lookahead_off)
+rsLine = not na(benchClose) and benchClose > 0 ? close / benchClose : na
+rsMa   = ta.sma(rsLine, rsMaLen)
+score5 = not na(rsLine) and not na(rsMa) and rsLine > rsMa
+
+// ════════════════════════════════════════════════════════
+// KRİTER 6 · TABAN SÜRESİ / KONSOLİDASYON
+// ════════════════════════════════════════════════════════
+rangeHi  = ta.highest(high, baseLen)
+rangeLo  = ta.lowest(low, baseLen)
+rangePct = rangeLo > 0 ? (rangeHi - rangeLo) / rangeLo * 100 : na
+// Limit ATR'ye bağlı dinamik: volatil hissede geniş, sakinde dar.
+// Örn. ATR% = 3.5, çarpan 8 -> limit %28. Sabit % fallback olarak durur.
+atrPct      = close > 0 ? atr14 / close * 100 : na
+effMaxRange = useAtrRange and not na(atrPct) ? baseAtrMult * atrPct : baseMaxRange
+score6      = not na(rangePct) and not na(effMaxRange) and rangePct <= effMaxRange
+
+// ════════════════════════════════════════════════════════
+// TOPLAM SKOR & KARAR
+// ════════════════════════════════════════════════════════
+score = (score1 ? 1 : 0) + (score2 ? 1 : 0) + (score3 ? 1 : 0) + (score4 ? 1 : 0) + (score5 ? 1 : 0) + (score6 ? 1 : 0)
+
+verdict = score <= 2 ? "DÜŞÜŞ DEVAM — DİP ARAMA" :
+     score == 3 ? "DURAKLAMA — İZLEME LİSTESİ" :
+     score <= 5 ? "TABAN OLUŞUYOR" :
+     "TABAN TEYİTLİ → ENTRY TIMING SCORE'A GEÇ"
+
+verdictColor = score <= 2 ? color.new(#ef5350, 0) :
+     score == 3 ? color.orange :
+     score <= 5 ? color.yellow :
+     color.new(#26a69a, 0)
+
+// ════════════════════════════════════════════════════════
+// GÖRSELLEŞTİRME
+// v3: Script artık overlay=false -> kendi ALT PANELİNDE yaşar
+// (hacim + RSI, sabit 0-100 ölçeği). Fiyat üstünde kalması
+// gerekenler force_overlay=true ile ana grafiğe zorlanır.
+// ════════════════════════════════════════════════════════
+plot(maSlow, "Yavaş SMA", color=score4 ? color.new(color.teal, 0) : color.new(color.red, 30), linewidth=2, force_overlay=true)
+plotshape(showShapes and capBar, title="Kapitülasyon", style=shape.triangleup, location=location.belowbar, color=color.orange, size=size.small, text="CAP", force_overlay=true)
+bgcolor(score >= 4 ? color.new(color.green, 92) : na, title="Taban bölgesi arka planı", force_overlay=true)
+
+// Heikin Ashi koruması: HA mumlarında skorlar sistematik olarak yanlıştır
+isStandardChart = chart.is_standard
+
+// ════════════════════════════════════════════════════════
+// ALT PANEL: HACİM + RSI (v3) & ENDEKS KARŞILAŞTIRMA
+// Panel sabit 0-100 ölçeğindedir, tabanı her zaman 0'dadır:
+//   Hacim kolonları = pencere maksimumunun yüzdesi (0-100)
+//   RSI çizgisi     = zaten 0-100 (mor, 30/70 noktalı referanslar)
+// Renk paleti Entry Timing Score ile aynıdır (tek elden görünüm):
+//   #0b8043 / #26a69a yeşil, #c0362c / #ef5350 kırmızı
+//   TURUNCU = RVOL >= kapitülasyon eşiği (Kriter 1'in aradığı bar)
+//   Koyu ton = RVOL >= 1.5, soluk ton = normal hacim
+// Endeks çizgileri force_overlay ile ANA grafiğe çizilir.
+// ════════════════════════════════════════════════════════
+bench2Close = request.security(benchSym2, timeframe.period, close, barmerge.gaps_off, barmerge.lookahead_off)
+
+vbMax   = ta.highest(volume, volLookback)
+volNorm = not na(vbMax) and vbMax > 0 ? volume / vbMax * 100 : 0.0
+vbUp    = close >= open
+volHigh = not na(rvol) and rvol >= 1.5
+capVol  = not na(rvol) and rvol >= capRvol
+vbCol   = capVol ? color.new(color.orange, 0) :
+     vbUp ? (volHigh ? color.new(#0b8043, 0) : color.new(#26a69a, 55)) :
+     (volHigh ? color.new(#c0362c, 0) : color.new(#ef5350, 55))
+plot(showVol ? volNorm : na, "Hacim (% maks)", color=vbCol, style=plot.style_columns)
+plot(showRsiBand ? rsi14 : na, "RSI", color=color.new(color.purple, 0), linewidth=2)
+hline(30, "RSI 30", color=color.new(color.gray, 45), linestyle=hline.style_dotted)
+hline(70, "RSI 70", color=color.new(color.gray, 45), linestyle=hline.style_dotted)
+
+// Etiket metni için sembolün ":" sonrası kısmı (örn. "SP:SPX" -> "SPX")
+symShort(string s) =>
+    parts = str.split(s, ":")
+    array.size(parts) > 0 ? array.get(parts, array.size(parts) - 1) : s
+
+var array<label> bandLabels = array.new<label>()
+var polyline idx1Pl = na
+var polyline idx2Pl = na
+
+if barstate.islast
+    // Önceki çizimleri temizle (her yeni tick'te yeniden çizilir)
+    for lb in bandLabels
+        label.delete(lb)
+    array.clear(bandLabels)
+    if not na(idx1Pl)
+        polyline.delete(idx1Pl)
+    if not na(idx2Pl)
+        polyline.delete(idx2Pl)
+
+    // ── RSI güncel değer etiketi (alt panelde) ──
+    if showRsiBand
+        array.push(bandLabels, label.new(bar_index + 2, rsi14, "RSI " + str.tostring(rsi14, "#.#"), xloc.bar_index, yloc.price, color.new(color.purple, 75), label.style_label_left, color.white, size.small))
+
+    // ── REBASE ENDEKS ÇİZGİLERİ (force_overlay -> ANA grafikte) ──
+    if showIdxCompare
+        refIdx   = volLookback - 1
+        stockRef = close[refIdx]
+        b1Ref    = benchClose[refIdx]
+        b2Ref    = bench2Close[refIdx]
+        if not na(stockRef) and stockRef > 0
+            // 1. endeks (skorda da kullanılan)
+            if not na(b1Ref) and b1Ref > 0
+                pts1 = array.new<chart.point>()
+                for k = 0 to refIdx
+                    i = refIdx - k
+                    bv = benchClose[i]
+                    if not na(bv)
+                        array.push(pts1, chart.point.from_index(bar_index - i, stockRef * bv / b1Ref))
+                if array.size(pts1) > 1
+                    idx1Pl := polyline.new(pts1, curved=false, closed=false, xloc=xloc.bar_index, line_color=color.new(color.blue, 20), line_style=line.style_solid, line_width=1, force_overlay=true)
+                    array.push(bandLabels, label.new(bar_index + 2, stockRef * benchClose / b1Ref, symShort(benchSym), xloc=xloc.bar_index, yloc=yloc.price, color=color.new(color.blue, 70), style=label.style_label_left, textcolor=color.white, size=size.small, force_overlay=true))
+            // 2. endeks (yalnızca görsel)
+            if not na(b2Ref) and b2Ref > 0
+                pts2 = array.new<chart.point>()
+                for k = 0 to refIdx
+                    i = refIdx - k
+                    bv2 = bench2Close[i]
+                    if not na(bv2)
+                        array.push(pts2, chart.point.from_index(bar_index - i, stockRef * bv2 / b2Ref))
+                if array.size(pts2) > 1
+                    idx2Pl := polyline.new(pts2, curved=false, closed=false, xloc=xloc.bar_index, line_color=color.new(color.yellow, 20), line_style=line.style_solid, line_width=1, force_overlay=true)
+                    array.push(bandLabels, label.new(bar_index + 2, stockRef * bench2Close / b2Ref, symShort(benchSym2), xloc=xloc.bar_index, yloc=yloc.price, color=color.new(color.yellow, 70), style=label.style_label_left, textcolor=color.black, size=size.small, force_overlay=true))
+
+var table t = table.new(position.top_right, 2, 10, bgcolor=color.new(#131722, 5), border_width=1, border_color=color.new(#434651, 0), frame_width=2, frame_color=color.new(#434651, 0), force_overlay=true)
+
+cellPass(bool ok) =>
+    ok ? "✓" : "✗"
+
+// Entry Timing Score ile aynı palet: yeşil #26a69a, kırmızı #ef5350
+cellColor(bool ok) =>
+    ok ? color.new(#26a69a, 0) : color.new(#ef5350, 0)
+
+// Zebra satır arka planı (okunabilirlik)
+rowBg(int r) =>
+    r % 2 == 0 ? color.new(#131722, 10) : color.new(#1e222d, 10)
+
+critRow(int r, string txt, bool ok) =>
+    table.cell(t, 0, r, txt, text_color=color.new(#d1d4dc, 0), text_size=size.normal, text_halign=text.align_left, bgcolor=rowBg(r))
+    table.cell(t, 1, r, cellPass(ok), text_color=cellColor(ok), text_size=size.normal, bgcolor=rowBg(r))
+
+if barstate.islast and showTable
+    table.cell(t, 0, 0, "  BOTTOM DETECTION  ", text_color=color.white, text_size=size.large, bgcolor=color.new(#2a2e39, 0), text_halign=text.align_left)
+    table.cell(t, 1, 0, "  " + str.tostring(score) + " / 6  ", text_color=verdictColor, text_size=size.large, bgcolor=color.new(#2a2e39, 0))
+
+    critRow(1, "  1 · Kapitülasyon", score1)
+    critRow(2, "  2 · Higher low + hacim kuruması", score2)
+    critRow(3, "  3 · RSI pozitif diverjans", score3)
+    critRow(4, "  4 · SMA" + str.tostring(maLen) + " yataylaştı (" + str.tostring(slopePct, "#.##") + "%)", score4)
+    critRow(5, "  5 · RS dönüşü (vs " + symShort(benchSym) + ")", score5)
+    critRow(6, "  6 · Taban (" + str.tostring(rangePct, "#.#") + "% / lim " + str.tostring(effMaxRange, "#.#") + "%)", score6)
+
+    table.cell(t, 0, 7, "  " + verdict + "  ", text_color=verdictColor, text_size=size.normal, text_halign=text.align_left, bgcolor=color.new(#2a2e39, 0))
+    table.cell(t, 1, 7, "", text_size=size.normal, bgcolor=color.new(#2a2e39, 0))
+
+    if not isStandardChart
+        table.cell(t, 0, 8, "  ⚠ HEIKIN ASHI / STANDART DIŞI GRAFİK", text_color=color.white, bgcolor=color.new(#c0362c, 0), text_size=size.normal, text_halign=text.align_left)
+        table.cell(t, 1, 8, "SKOR GEÇERSİZ", text_color=color.white, bgcolor=color.new(#c0362c, 0), text_size=size.normal)
+
+    // v2.1: string karşılaştırması ("D") bazı ortamlarda "1D" döndüğü
+    // için yanlış uyarı veriyordu; Pine'ın kendi bayrağı kullanılıyor.
+    if not timeframe.isdaily
+        table.cell(t, 0, 9, "  ⚠ Günlük grafik için tasarlandı", text_color=color.orange, text_size=size.normal, text_halign=text.align_left)
+        table.cell(t, 1, 9, timeframe.period, text_color=color.orange, text_size=size.normal)
+
+// Alert: taban teyidi
+alertcondition(score >= 4 and score[1] < 4, title="BDS: Taban oluşuyor (4+)", message="Bottom Detection Score 4/6 eşiğini geçti")
+alertcondition(score == 6 and score[1] < 6, title="BDS: Taban teyitli (6/6)", message="Bottom Detection Score 6/6 — Entry Timing Score'a geç")
